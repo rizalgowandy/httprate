@@ -7,112 +7,71 @@ import (
 	"time"
 )
 
-func Limit(requestLimit int, windowLength time.Duration, options ...Option) func(next http.Handler) http.Handler {
-	return NewRateLimiter(requestLimit, windowLength, options...).Handler
+// LimitBy is the canonical entry point for rate-limiting by an explicit key.
+//
+// It is shorthand for Limit with keyFn installed as the rate-limit key. The
+// key is a required positional argument, so every call site has to state, on
+// purpose, what it rate-limits by.
+//
+// To rate-limit by a trusted client IP behind a proxy, resolve the IP with one
+// of chi's middleware.ClientIPFrom* middlewares (chi v5.3.0+) and read it back
+// in the KeyFunc; CanonicalizeIP buckets IPv6 clients by their /64:
+//
+//	r.Use(middleware.ClientIPFromXFF("10.0.0.0/8"))
+//	r.Use(httprate.LimitBy(100, time.Minute, func(r *http.Request) (string, error) {
+//		return httprate.CanonicalizeIP(middleware.GetClientIP(r.Context())), nil
+//	}))
+//
+// Use JoinKeys to rate-limit by more than one dimension at once:
+//
+//	r.Use(httprate.LimitBy(100, time.Minute,
+//		httprate.JoinKeys(clientIPKey, httprate.KeyByEndpoint)))
+func LimitBy(requestLimit int, windowLength time.Duration, keyFn KeyFunc, options ...Option) func(next http.Handler) http.Handler {
+	return NewRateLimiter(requestLimit, windowLength, append([]Option{WithKeyFuncs(keyFn)}, options...)...).Handler
 }
 
 type KeyFunc func(r *http.Request) (string, error)
-type Option func(rl *rateLimiter)
+type Option func(rl *RateLimiter)
 
-func LimitAll(requestLimit int, windowLength time.Duration) func(next http.Handler) http.Handler {
-	return Limit(requestLimit, windowLength)
+// Set custom response headers. If empty, the header is omitted.
+type ResponseHeaders struct {
+	Limit      string // Default: X-RateLimit-Limit
+	Remaining  string // Default: X-RateLimit-Remaining
+	Increment  string // Default: X-RateLimit-Increment
+	Reset      string // Default: X-RateLimit-Reset
+	RetryAfter string // Default: Retry-After
 }
 
-func LimitByIP(requestLimit int, windowLength time.Duration) func(next http.Handler) http.Handler {
-	return Limit(requestLimit, windowLength, WithKeyFuncs(KeyByIP))
-}
-
-func LimitByRealIP(requestLimit int, windowLength time.Duration) func(next http.Handler) http.Handler {
-	return Limit(requestLimit, windowLength, WithKeyFuncs(KeyByRealIP))
-}
-
-func KeyByIP(r *http.Request) (string, error) {
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		ip = r.RemoteAddr
-	}
-	return canonicalizeIP(ip), nil
-}
-
-func KeyByRealIP(r *http.Request) (string, error) {
-	var ip string
-
-	if tcip := r.Header.Get("True-Client-IP"); tcip != "" {
-		ip = tcip
-	} else if xrip := r.Header.Get("X-Real-IP"); xrip != "" {
-		ip = xrip
-	} else if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		i := strings.Index(xff, ", ")
-		if i == -1 {
-			i = len(xff)
-		}
-		ip = xff[:i]
-	} else {
-		var err error
-		ip, _, err = net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			ip = r.RemoteAddr
-		}
-	}
-
-	return canonicalizeIP(ip), nil
-}
-
-func KeyByEndpoint(r *http.Request) (string, error) {
-	return r.URL.Path, nil
-}
-
-func WithKeyFuncs(keyFuncs ...KeyFunc) Option {
-	return func(rl *rateLimiter) {
-		if len(keyFuncs) > 0 {
-			rl.keyFn = composedKeyFunc(keyFuncs...)
-		}
-	}
-}
-
-func WithKeyByIP() Option {
-	return WithKeyFuncs(KeyByIP)
-}
-
-func WithKeyByRealIP() Option {
-	return WithKeyFuncs(KeyByRealIP)
-}
-
-func WithLimitHandler(h http.HandlerFunc) Option {
-	return func(rl *rateLimiter) {
-		rl.onRequestLimit = h
-	}
-}
-
-func WithLimitCounter(c LimitCounter) Option {
-	return func(rl *rateLimiter) {
-		rl.limitCounter = c
-	}
-}
-
-func WithNoop() Option {
-	return func(rl *rateLimiter) {}
-}
-
-func composedKeyFunc(keyFuncs ...KeyFunc) KeyFunc {
+func Key(key string) func(r *http.Request) (string, error) {
 	return func(r *http.Request) (string, error) {
-		var key strings.Builder
-		for i := 0; i < len(keyFuncs); i++ {
-			k, err := keyFuncs[i](r)
-			if err != nil {
-				return "", err
-			}
-			key.WriteString(k)
-			key.WriteRune(':')
-		}
-		return key.String(), nil
+		return key, nil
 	}
 }
 
-// canonicalizeIP returns a form of ip suitable for comparison to other IPs.
-// For IPv4 addresses, this is simply the whole string.
-// For IPv6 addresses, this is the /64 prefix.
-func canonicalizeIP(ip string) string {
+// CanonicalizeIP normalizes a client IP string for use as a rate-limit key:
+//
+//   - IPv4 addresses are returned unchanged.
+//   - IPv6 addresses are reduced to their /64 prefix. An IPv6 client typically
+//     controls a whole /64 (2^64 addresses via SLAAC), so keying on the full
+//     address would let it rotate within its own /64 to win a fresh bucket per
+//     request and bypass a per-IP limit. Widen/narrow the prefix yourself if your
+//     clients are delegated a larger block (e.g. a /56 or /48).
+//   - Any other string, including "", is returned unchanged.
+//
+// httprate stays router-agnostic, so it does not resolve the client IP for you —
+// pair CanonicalizeIP with whatever does. With chi's middleware.ClientIPFrom*
+// (chi v5.3.0+) and middleware.GetClientIP:
+//
+//	r.Use(middleware.ClientIPFromXFF("10.0.0.0/8"))
+//	r.Use(httprate.LimitBy(100, time.Minute, func(r *http.Request) (string, error) {
+//		return httprate.CanonicalizeIP(middleware.GetClientIP(r.Context())), nil
+//	}))
+//
+// WARNING: if the resolver returns "" (e.g. no ClientIPFrom* middleware is
+// installed upstream), CanonicalizeIP returns "" and every request shares a
+// single global rate-limit bucket. Strictly more restrictive, but a footgun —
+// make sure the client IP is actually resolved upstream.
+func CanonicalizeIP(ip string) string {
 	isIPv6 := false
 	// This is how net.ParseIP decides if an address is IPv6
 	// https://cs.opensource.google/go/go/+/refs/tags/go1.17.7:src/net/ip.go;l=704
@@ -124,7 +83,6 @@ func canonicalizeIP(ip string) string {
 		case ':':
 			// IPv6
 			isIPv6 = true
-			break
 		}
 	}
 	if !isIPv6 {
@@ -138,4 +96,69 @@ func canonicalizeIP(ip string) string {
 	}
 
 	return ipv6.Mask(net.CIDRMask(64, 128)).String()
+}
+
+func KeyByEndpoint(r *http.Request) (string, error) {
+	return r.URL.Path, nil
+}
+
+func WithKeyFuncs(keyFuncs ...KeyFunc) Option {
+	return func(rl *RateLimiter) {
+		if len(keyFuncs) > 0 {
+			rl.keyFn = JoinKeys(keyFuncs...)
+		}
+	}
+}
+
+func WithLimitHandler(h http.HandlerFunc) Option {
+	return func(rl *RateLimiter) {
+		rl.onRateLimited = h
+	}
+}
+
+func WithErrorHandler(h func(http.ResponseWriter, *http.Request, error)) Option {
+	return func(rl *RateLimiter) {
+		rl.onError = h
+	}
+}
+
+func WithLimitCounter(c LimitCounter) Option {
+	return func(rl *RateLimiter) {
+		rl.limitCounter = c
+	}
+}
+
+func WithResponseHeaders(headers ResponseHeaders) Option {
+	return func(rl *RateLimiter) {
+		rl.headers = headers
+	}
+}
+
+func WithNoop() Option {
+	return func(rl *RateLimiter) {}
+}
+
+// JoinKeys joins the results of several KeyFuncs into a single key with ":"
+// separators, so they can be passed to LimitBy's positional key slot for
+// multi-dimensional rate-limiting:
+//
+//	r.Use(httprate.LimitBy(100, time.Minute,
+//		httprate.JoinKeys(clientIPKey, httprate.KeyByEndpoint)))
+//
+// where clientIPKey is your own client-IP KeyFunc (see LimitBy and
+// CanonicalizeIP). It is the positional-argument equivalent of WithKeyFuncs. If any component
+// KeyFunc returns an error, the joined key returns that error.
+func JoinKeys(fns ...KeyFunc) KeyFunc {
+	return func(r *http.Request) (string, error) {
+		var key strings.Builder
+		for i := 0; i < len(fns); i++ {
+			k, err := fns[i](r)
+			if err != nil {
+				return "", err
+			}
+			key.WriteString(k)
+			key.WriteRune(':')
+		}
+		return key.String(), nil
+	}
 }
